@@ -31,6 +31,7 @@
 #include "cryptography/default_hash_provider.hpp"
 #include "interfaces/iroha_internal/transaction_batch_factory.hpp"
 #include "validators/default_validator.hpp"
+#include "validators/protobuf/proto_transaction_validator.hpp"
 
 namespace torii {
 
@@ -134,6 +135,33 @@ namespace torii {
   }
 
   void CommandService::ListTorii(const iroha::protocol::TxList &tx_list) {
+    auto process_error = [this, &tx_list](auto &error) {
+      auto &txs = tx_list.transactions();
+      if (txs.empty()) {
+        log_->warn("Received no transactions");
+        return;
+      }
+      auto error_msg = formErrorMessage(txs, error);
+      // set error response for each transaction in a sequence
+      std::for_each(txs.begin(), txs.end(), [this, &error_msg](auto &tx) {
+        auto response = makeResponse(
+            hash, iroha::protocol::TxStatus::STATELESS_VALIDATION_FAILED);
+        response.set_error_message(error_msg);
+
+        this->pushStatus("ToriiList", std::move(hash), std::move(response));
+      };
+    };
+    shared_model::validation::ProtoTransactionValidator proto_validator;
+    for (const auto &tx : tx_list.transactions()) {
+      auto answer = proto_validator.validate(tx);
+      if (answer.hasErrors()) {
+        auto hash = shared_model::crypto::DefaultHashProvider::makeHash(
+            shared_model::proto::makeBlob(tx.payload()));
+        process_error(std::string("Transaction with hash ") + hash.toString());
+        break;
+      }
+    }
+
     auto tx_list_builder = shared_model::proto::TransportBuilder<
         shared_model::interface::TransactionSequence,
         shared_model::validation::DefaultUnsignedTransactionsValidator>();
@@ -147,25 +175,7 @@ namespace torii {
             processBatch(batch);
           }
         },
-        [this, &tx_list](auto &error) {
-          auto &txs = tx_list.transactions();
-          if (txs.empty()) {
-            log_->warn("Received no transactions");
-            return;
-          }
-          auto error_msg = formErrorMessage(txs, error.error);
-          // set error response for each transaction in a sequence
-          std::for_each(txs.begin(), txs.end(), [this, &error_msg](auto &tx) {
-            auto hash = shared_model::crypto::DefaultHashProvider::makeHash(
-                shared_model::proto::makeBlob(tx.payload()));
-
-            auto response = makeResponse(
-                hash, iroha::protocol::TxStatus::STATELESS_VALIDATION_FAILED);
-            response.set_error_message(error_msg);
-
-            this->pushStatus("ToriiList", std::move(hash), std::move(response));
-          });
-        });
+        [this, &tx_list](auto &error) { process_error(error.error); });
   }
 
   grpc::Status CommandService::Torii(
